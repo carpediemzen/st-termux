@@ -4,12 +4,14 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 readonly ST_REPO_HTTPS="https://github.com/SillyTavern/SillyTavern.git"
 readonly ST_MIN_NODE_MAJOR=20
 readonly SELF_REPO_RAW="carpediemzen/st-termux/main/install.sh"
 readonly RC_BLOCK_START="# >>> st-termux >>>"
 readonly RC_BLOCK_END="# <<< st-termux <<<"
+readonly AUTOSTART_BLOCK_START="# >>> st-termux-autostart >>>"
+readonly AUTOSTART_BLOCK_END="# <<< st-termux-autostart <<<"
 
 # 默认运行参数（可通过环境变量或 CLI 参数覆盖）
 ST_DIR="${ST_DIR:-$HOME/SillyTavern}"
@@ -19,8 +21,9 @@ ST_GITHUB_BASE="${ST_GITHUB_BASE:-}"
 ST_NPM_REGISTRY="${ST_NPM_REGISTRY:-}"
 ST_ACTION=""
 ST_YES=0
-ST_APPLY_PERF=""   # ""=按交互/默认处理, "1"=启用, "0"=跳过
-ST_APPLY_ALIAS=""  # ""=按交互/默认处理, "1"=启用, "0"=跳过
+ST_APPLY_PERF=""       # ""=按交互/默认处理, "1"=启用, "0"=跳过
+ST_APPLY_ALIAS=""      # ""=按交互/默认处理, "1"=启用, "0"=跳过
+ST_APPLY_AUTOSTART=""  # ""=按交互/默认处理, "1"=开启, "0"=关闭
 ST_START_AFTER=0
 
 # 测速结果全局状态
@@ -791,6 +794,51 @@ self_install_cli() {
   return 1
 }
 
+detect_shell_rc_files() {
+  local mode="${1:-active}" # active=写入目标 | all=全部存在的 rc
+  local -a files=()
+
+  if [[ "$mode" == "all" ]]; then
+    [[ -f "$HOME/.bashrc" ]] && files+=("$HOME/.bashrc")
+    [[ -f "$HOME/.zshrc" ]] && files+=("$HOME/.zshrc")
+    if (( ${#files[@]} == 0 )); then
+      files+=("$HOME/.bashrc")
+    fi
+    printf '%s\n' "${files[@]}"
+    return 0
+  fi
+
+  local shell_name
+  shell_name=$(basename "${SHELL:-bash}")
+  if [[ "$shell_name" == "zsh" || -f "$HOME/.zshrc" ]]; then
+    files+=("$HOME/.zshrc")
+  fi
+  if [[ "$shell_name" == "bash" || -f "$HOME/.bashrc" || ${#files[@]} -eq 0 ]]; then
+    files+=("$HOME/.bashrc")
+  fi
+  printf '%s\n' "${files[@]}"
+}
+
+remove_rc_block() {
+  local rc_file="$1"
+  local start_mark="$2"
+  local end_mark="$3"
+  [[ -f "$rc_file" ]] || return 0
+
+  local tmp_rc
+  tmp_rc=$(make_temp_file)
+  awk -v s="$start_mark" -v e="$end_mark" '
+    $0 == s { skip = 1; next }
+    $0 == e { skip = 0; next }
+    !skip { lines[++n] = $0 }
+    END {
+      while (n > 0 && lines[n] ~ /^[[:space:]]*$/) n--
+      for (i = 1; i <= n; i++) print lines[i]
+    }
+  ' "$rc_file" > "$tmp_rc"
+  mv "$tmp_rc" "$rc_file"
+}
+
 inject_shell_shortcuts() {
   local target_dir="$1"
   local has_stmenu=0
@@ -799,14 +847,10 @@ inject_shell_shortcuts() {
   fi
 
   local -a rc_files=()
-  local shell_name
-  shell_name=$(basename "${SHELL:-bash}")
-  if [[ "$shell_name" == "zsh" || -f "$HOME/.zshrc" ]]; then
-    rc_files+=("$HOME/.zshrc")
-  fi
-  if [[ "$shell_name" == "bash" || -f "$HOME/.bashrc" || ${#rc_files[@]} -eq 0 ]]; then
-    rc_files+=("$HOME/.bashrc")
-  fi
+  local line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && rc_files+=("$line")
+  done < <(detect_shell_rc_files active)
 
   local block
   block="${RC_BLOCK_START}
@@ -823,20 +867,101 @@ alias stup='cd \"${target_dir}\" && git pull --rebase --autostash'"
   block="${block}
 ${RC_BLOCK_END}"
 
-  local rc tmp_rc
+  local rc
   for rc in "${rc_files[@]}"; do
     [[ -f "$rc" ]] || touch "$rc"
-    tmp_rc=$(make_temp_file)
-    # 先移除既有托管块，确保重复运行严格幂等
-    awk -v s="$RC_BLOCK_START" -v e="$RC_BLOCK_END" '
-      $0 == s { skip = 1; next }
-      $0 == e { skip = 0; next }
-      !skip { print }
-    ' "$rc" > "$tmp_rc"
-    printf '\n%s\n' "$block" >> "$tmp_rc"
-    mv "$tmp_rc" "$rc"
+    remove_rc_block "$rc" "$RC_BLOCK_START" "$RC_BLOCK_END"
+    printf '\n%s\n' "$block" >> "$rc"
     log_ok "已写入快捷指令到 $rc (st 启动 / stup 更新${has_stmenu:+ / stmenu 菜单})"
   done
+}
+
+is_autostart_enabled() {
+  local rc
+  while IFS= read -r rc; do
+    if [[ -f "$rc" ]] && grep -Fq -- "$AUTOSTART_BLOCK_START" "$rc"; then
+      return 0
+    fi
+  done < <(detect_shell_rc_files all)
+  return 1
+}
+
+enable_termux_autostart() {
+  local target_dir="$1"
+  if ! self_install_cli; then
+    die "无法将管理脚本缓存到 ~/.local/bin/st-termux，暂不能配置自启动。"
+  fi
+
+  local -a rc_files=()
+  local line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && rc_files+=("$line")
+  done < <(detect_shell_rc_files active)
+
+  local block
+  block="${AUTOSTART_BLOCK_START}
+case \$- in
+  *i*)
+    if [[ -z \"\${ST_NO_AUTOSTART:-}\" && -z \"\${ST_AUTOSTART_ACTIVE:-}\" && -f \"${target_dir}/start.sh\" ]]; then
+      ST_AUTOSTART_ACTIVE=1
+      export ST_AUTOSTART_ACTIVE
+      if [[ -x \"\$HOME/.local/bin/st-termux\" ]]; then
+        \"\$HOME/.local/bin/st-termux\" autostart -d \"${target_dir}\" || true
+      fi
+    fi
+    ;;
+esac
+${AUTOSTART_BLOCK_END}"
+
+  local rc
+  for rc in "${rc_files[@]}"; do
+    [[ -f "$rc" ]] || touch "$rc"
+    remove_rc_block "$rc" "$AUTOSTART_BLOCK_START" "$AUTOSTART_BLOCK_END"
+    printf '\n%s\n' "$block" >> "$rc"
+    log_ok "已开启打开 Termux 默认自启动 (写入: $rc)"
+  done
+  log_info "提示：启动后按 Ctrl+C 可停止酒馆并返回终端；输入 stmenu 可随时在设置中关闭自启动。"
+}
+
+disable_termux_autostart() {
+  local rc removed=0
+  while IFS= read -r rc; do
+    if [[ -f "$rc" ]] && grep -Fq -- "$AUTOSTART_BLOCK_START" "$rc"; then
+      remove_rc_block "$rc" "$AUTOSTART_BLOCK_START" "$AUTOSTART_BLOCK_END"
+      log_ok "已从 $rc 关闭 Termux 默认自启动。"
+      removed=1
+    fi
+  done < <(detect_shell_rc_files all)
+
+  if (( removed == 0 )); then
+    log_info "当前未开启 Termux 默认自启动，无需更改。"
+  fi
+}
+
+get_st_port() {
+  local target_dir="$1"
+  local cfg="$target_dir/config.yaml"
+  [[ -f "$cfg" ]] || cfg="$target_dir/default/config.yaml"
+  local port="8000"
+  if [[ -f "$cfg" ]]; then
+    local parsed
+    parsed=$(awk -F: '/^port:[[:space:]]*[0-9]+/ { gsub(/[^0-9]/, "", $2); print $2; exit }' "$cfg" 2>/dev/null || true)
+    [[ "$parsed" =~ ^[0-9]+$ ]] && port="$parsed"
+  fi
+  printf '%s\n' "$port"
+}
+
+is_sillytavern_running() {
+  local target_dir="$1"
+  local port
+  port=$(get_st_port "$target_dir")
+
+  if command -v node >/dev/null 2>&1; then
+    if node -e "const n=require('net'),s=n.connect({host:'127.0.0.1',port:Number(process.argv[1])},()=>{s.destroy();process.exit(0)});s.setTimeout(250,()=>{s.destroy();process.exit(1)});s.on('error',()=>process.exit(1));" "$port" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -872,8 +997,14 @@ action_install() {
     apply_android_performance_preset "$ST_DIR"
   fi
 
-  if [[ "$ST_APPLY_ALIAS" == "1" ]] || { [[ -z "$ST_APPLY_ALIAS" ]] && confirm_action "是否写入快捷命令 st / stup 到 shell 配置？" "Y"; }; then
+  if [[ "$ST_APPLY_ALIAS" == "1" ]] || { [[ -z "$ST_APPLY_ALIAS" ]] && confirm_action "是否写入快捷命令 st / stup / stmenu 到 shell 配置？" "Y"; }; then
     inject_shell_shortcuts "$ST_DIR"
+  fi
+
+  if [[ "$ST_APPLY_AUTOSTART" == "1" ]] || { [[ -z "$ST_APPLY_AUTOSTART" ]] && confirm_action "是否开启打开 Termux 时默认自动启动 SillyTavern（可在设置里随时关闭）？" "Y"; }; then
+    enable_termux_autostart "$ST_DIR"
+  elif [[ "$ST_APPLY_AUTOSTART" == "0" ]]; then
+    disable_termux_autostart
   fi
 
   echo
@@ -910,6 +1041,26 @@ action_start() {
   log_info "正在启动 SillyTavern..."
   cd "$ST_DIR"
   exec bash start.sh
+}
+
+action_autostart() {
+  is_st_directory "$ST_DIR" || return 0
+  if is_sillytavern_running "$ST_DIR"; then
+    local port
+    port=$(get_st_port "$ST_DIR")
+    log_info "检测到 SillyTavern 已在端口 $port 运行，跳过重复自启动（输入 stmenu 可打开设置）。"
+    return 0
+  fi
+
+  if command -v termux-wake-lock >/dev/null 2>&1; then
+    termux-wake-lock 2>/dev/null || true
+  fi
+  log_info "正在自动启动 SillyTavern（按 Ctrl+C 可停止并回到终端；可在 stmenu -> 设置 中关闭自启动）..."
+  # 不用 exec，便于按 Ctrl+C 停止后保留 Termux 命令行继续操作
+  (
+    cd "$ST_DIR"
+    bash start.sh
+  ) || true
 }
 
 action_doctor() {
@@ -960,6 +1111,7 @@ action_doctor() {
   else
     printf 'SillyTavern  : 未在 %s 检测到有效安装\n' "$ST_DIR"
   fi
+  printf '打开默认启动 : %s\n' "$(is_autostart_enabled && echo 已开启 || echo 已关闭)"
   echo "===================================================="
   if (( issues > 0 )); then
     log_warn "发现 $issues 项环境问题，可通过一键安装/环境补全自动修复。"
@@ -977,22 +1129,44 @@ action_mirror() {
 }
 
 action_config_menu() {
+  # 允许命令行直接开关自启动：st-termux config --autostart / --no-autostart
+  if [[ "$ST_APPLY_AUTOSTART" == "1" ]]; then
+    is_st_directory "$ST_DIR" || die "未在 $ST_DIR 找到 SillyTavern，请先安装。"
+    enable_termux_autostart "$ST_DIR"
+    return 0
+  elif [[ "$ST_APPLY_AUTOSTART" == "0" ]]; then
+    disable_termux_autostart
+    return 0
+  fi
+
   is_st_directory "$ST_DIR" || die "未在 $ST_DIR 找到 SillyTavern，请先安装。"
   while true; do
+    local autostart_label="已关闭"
+    if is_autostart_enabled; then
+      autostart_label="已开启"
+    fi
     echo
-    printf '%s--- 配置与快捷命令 (%s) ---%s\n' "$C_BOLD" "$ST_DIR" "$C_RESET"
-    echo "1) 应用安卓低内存与性能预设 (lazyLoadCharacters/关闭磁盘缓存/禁弹浏览器)"
-    echo "2) 写入/刷新 shell 快捷命令 (st / stup / stmenu)"
-    echo "3) 开启局域网访问 (listen: true)"
-    echo "4) 关闭局域网访问 (listen: false)"
+    printf '%s--- 设置与快捷命令 (%s) ---%s\n' "$C_BOLD" "$ST_DIR" "$C_RESET"
+    echo "1) 切换打开 Termux 默认启动 (当前: ${autostart_label})"
+    echo "2) 应用安卓低内存与性能预设 (lazyLoadCharacters/关闭磁盘缓存/禁弹浏览器)"
+    echo "3) 写入/刷新 shell 快捷命令 (st / stup / stmenu)"
+    echo "4) 开启局域网访问 (listen: true)"
+    echo "5) 关闭局域网访问 (listen: false)"
     echo "0) 返回"
     local choice=""
-    tty_read "请选择 [0-4]: " choice "0"
+    tty_read "请选择 [0-5]: " choice "0"
     case "$choice" in
-      1) apply_android_performance_preset "$ST_DIR" ;;
-      2) inject_shell_shortcuts "$ST_DIR" ;;
-      3) toggle_lan_listen "$ST_DIR" "true" ;;
-      4) toggle_lan_listen "$ST_DIR" "false" ;;
+      1)
+        if is_autostart_enabled; then
+          disable_termux_autostart
+        else
+          enable_termux_autostart "$ST_DIR"
+        fi
+        ;;
+      2) apply_android_performance_preset "$ST_DIR" ;;
+      3) inject_shell_shortcuts "$ST_DIR" ;;
+      4) toggle_lan_listen "$ST_DIR" "true" ;;
+      5) toggle_lan_listen "$ST_DIR" "false" ;;
       0) break ;;
       *) log_warn "无效选项: $choice" ;;
     esac
@@ -1017,7 +1191,7 @@ st-termux v${SCRIPT_VERSION} - Termux 快速安装与维护 SillyTavern（酒馆
   start,   --start      启动 SillyTavern
   doctor,  --doctor     运行 Termux 与酒馆环境自检
   mirror,  --mirror     测速并配置 Termux / GitHub / npm 加速源
-  config,  --config     配置性能预设、快捷命令与局域网监听
+  config,  --config     打开设置（自启动开关、性能预设、快捷命令、局域网）
 
 选项:
   -d, --dir <路径>          SillyTavern 安装目录 (默认: \$HOME/SillyTavern)
@@ -1028,6 +1202,8 @@ st-termux v${SCRIPT_VERSION} - Termux 快速安装与维护 SillyTavern（酒馆
   --npm-registry <URL>      自定义 npm 源 URL
   --perf / --no-perf        强制开启或跳过安卓 config.yaml 性能预设
   --alias / --no-alias      强制开启或跳过写入 shell 快捷指令
+  --autostart / --no-autostart
+                            开启或关闭打开 Termux 默认启动（可配合 install / config）
   --start-after             安装完成后立即启动酒馆
   -y, --yes                 非交互模式，自动确认所有推荐步骤
   -h, --help                显示此帮助信息
@@ -1041,6 +1217,7 @@ parse_args() {
       install|--install) ST_ACTION="install"; shift ;;
       update|--update) ST_ACTION="update"; shift ;;
       start|--start) ST_ACTION="start"; shift ;;
+      autostart) ST_ACTION="autostart"; shift ;;
       doctor|--doctor) ST_ACTION="doctor"; shift ;;
       mirror|--mirror) ST_ACTION="mirror"; shift ;;
       config|--config) ST_ACTION="config"; shift ;;
@@ -1077,6 +1254,8 @@ parse_args() {
       --no-perf) ST_APPLY_PERF="0"; shift ;;
       --alias) ST_APPLY_ALIAS="1"; shift ;;
       --no-alias) ST_APPLY_ALIAS="0"; shift ;;
+      --autostart) ST_APPLY_AUTOSTART="1"; shift ;;
+      --no-autostart) ST_APPLY_AUTOSTART="0"; shift ;;
       --start-after) ST_START_AFTER=1; shift ;;
       -y|--yes) ST_YES=1; shift ;;
       -h|--help) show_help; exit 0 ;;
@@ -1102,7 +1281,7 @@ interactive_menu() {
     echo " 3) 启动 SillyTavern"
     echo " 4) 环境诊断与状态检查"
     echo " 5) 网络测速与切换国内镜像 (pkg/GitHub/npm)"
-    echo " 6) 性能预设、快捷命令与局域网设置"
+    echo " 6) 设置 (自启动开关 / 性能预设 / 快捷命令 / 局域网)"
     echo " 7) 切换目标分支 (当前: $ST_BRANCH)"
     echo " 0) 退出"
 
@@ -1135,6 +1314,7 @@ main() {
     install) action_install ;;
     update) action_update ;;
     start) action_start ;;
+    autostart) action_autostart ;;
     doctor) action_doctor ;;
     mirror) action_mirror ;;
     config) action_config_menu ;;

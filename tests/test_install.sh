@@ -363,6 +363,7 @@ assert_eq "true" "$chat_enabled" "backups.chat.enabled 保持 true 不受影响"
 
 assert_file_contains "$c1/home/.bashrc" "alias st='cd \"$c1/home/SillyTavern\" && bash start.sh'" "bashrc 写入 st 别名"
 assert_file_contains "$c1/home/.bashrc" "alias stup='st-termux update" "bashrc 写入 stup 更新别名"
+assert_file_contains "$c1/home/.bashrc" "# >>> st-termux-autostart >>>" "默认开启打开 Termux 自启动"
 [[ -x "$c1/home/.local/bin/st-termux" ]] && pass "CLI 脚本缓存到 ~/.local/bin/st-termux 且可执行" || fail "st-termux 未就位"
 
 echo "=== 4. 重复安装幂等性、用户数据保护与分支切换更新 ==="
@@ -374,6 +375,8 @@ assert_file_contains "$c1/home/SillyTavern/data/card.json" "user_secret_card" "�
 assert_file_contains "$cfg" "# custom comment" "指定 --no-perf 时保留用户 config.yaml"
 block_count=$(grep -c '# >>> st-termux >>>' "$c1/home/.bashrc")
 assert_eq "1" "$block_count" "重复运行后 bashrc 快捷指令块不重复"
+autostart_count=$(grep -c '# >>> st-termux-autostart >>>' "$c1/home/.bashrc")
+assert_eq "1" "$autostart_count" "重复运行后 bashrc 自启动块不重复"
 
 : > "$c1/logs/git.log"
 run_as_nobody "$c1" "bash '$SCRIPT' update -b staging -y"
@@ -460,6 +463,65 @@ run_as_nobody "$c3" "bash '$SCRIPT' install -y --no-perf --no-alias"
 git_failover_log=$(cat "$c3/logs/git.log")
 assert_contains "$git_failover_log" "gh-proxy.com" "先尝试第一顺位 gh-proxy"
 assert_contains "$git_failover_log" "gitclone.com" "gh-proxy clone 失败后自动顺延第二顺位 gitclone.com"
+
+echo "=== 9. 打开 Termux 默认自启动：开关切换、重复启动防护与快捷命令保留 ==="
+doc_on=$(run_as_nobody "$c1" "bash '$SCRIPT' doctor")
+assert_contains "$doc_on" "打开默认启动 : 已开启" "doctor 正确显示自启动已开启"
+
+# 在设置中关闭自启动
+off_out=$(run_as_nobody "$c1" "bash '$SCRIPT' config --no-autostart")
+assert_contains "$off_out" "关闭 Termux 默认自启动" "config --no-autostart 成功关闭自启动"
+if grep -Fq '# >>> st-termux-autostart >>>' "$c1/home/.bashrc"; then
+  fail "关闭自启动后不应残留自启动块"
+else
+  pass "关闭自启动后已清理自启动块"
+fi
+assert_file_contains "$c1/home/.bashrc" "# >>> st-termux >>>" "关闭自启动时保留快捷指令块"
+
+doc_off=$(run_as_nobody "$c1" "bash '$SCRIPT' doctor")
+assert_contains "$doc_off" "打开默认启动 : 已关闭" "doctor 正确显示自启动已关闭"
+
+# 重新开启并验证重复运行/端口已占用保护
+on_out=$(run_as_nobody "$c1" "bash '$SCRIPT' config -d '$c1/home/SillyTavern' --autostart")
+assert_contains "$on_out" "已开启打开 Termux 默认自启动" "config --autostart 重新开启自启动"
+
+# 1) 模拟端口未占用时，autostart 应真正执行 start.sh
+cat > "$c1/home/SillyTavern/start.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "STARTED_BY_AUTOSTART" >> "$MOCK_LOGS/autostart.log"
+EOF
+cat > "$c1/avail/node24" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-v" ]]; then echo "v24.22.3"; exit 0; fi
+if [[ "${1:-}" == "-e" ]]; then exit 1; fi
+exit 0
+EOF
+chmod +x "$c1/home/SillyTavern/start.sh" "$c1/avail/node24"
+
+run_as_nobody "$c1" "bash '$SCRIPT' autostart -d '$c1/home/SillyTavern'"
+assert_file_contains "$c1/logs/autostart.log" "STARTED_BY_AUTOSTART" "端口空闲时 autostart 启动酒馆"
+
+# 2) 模拟端口已在监听时，autostart 应跳过避免冲突
+cat > "$c1/avail/node24" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-v" ]]; then echo "v24.22.3"; exit 0; fi
+if [[ "${1:-}" == "-e" ]]; then exit 0; fi
+exit 0
+EOF
+chmod +x "$c1/avail/node24"
+skip_out=$(run_as_nobody "$c1" "bash '$SCRIPT' autostart -d '$c1/home/SillyTavern'")
+assert_contains "$skip_out" "跳过重复自启动" "检测到端口已监听时跳过重复自启动"
+
+# 3) --no-autostart 安装参数验证（case2 使用了 --no-alias，默认没传 --no-autostart 会写 autostart，这里单测显式 --no-autostart）
+c4="$TEST_ROOT/case4"
+setup_sandbox "$c4"
+ln -sf "$c4/avail/curl" "$c4/prefix/bin/curl"
+run_as_nobody "$c4" "bash '$SCRIPT' install -y --no-perf --no-alias --no-autostart"
+if [[ -f "$c4/home/.bashrc" ]] && grep -Fq '# >>> st-termux-autostart >>>' "$c4/home/.bashrc"; then
+  fail "传入 --no-autostart 时不应开启自启动"
+else
+  pass "传入 --no-autostart 时跳过自启动配置"
+fi
 
 echo "----------------------------------------"
 printf '测试汇总: PASS=%d FAIL=%d\n' "$PASS_COUNT" "$FAIL_COUNT"

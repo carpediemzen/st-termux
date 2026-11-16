@@ -16,6 +16,7 @@
   - 使用 `--depth 1` 单分支浅克隆节省手机空间；重复安装或更新时自动保留 `data/`、`backups/` 与 `config.yaml`。
 - **开箱体验优化**：
   - 可选应用安卓 `config.yaml` 性能预设（启用角色卡懒加载、关闭磁盘缓存、禁用桌面自动弹浏览器），自动备份原配置。
+  - 默认支持**打开 Termux 自动启动 SillyTavern**（自动检测端口防重复拉起，按 `Ctrl+C` 停止即可回到命令行），可在 **设置 (`stmenu` -> `6`)** 中随时一键开启或关闭。
   - 幂等写入 shell 快捷命令：`st`（启动）、`stup`（自动测速更新）、`stmenu`（打开管理菜单）。
 
 ## 前置准备
@@ -59,7 +60,7 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/carpediemzen/st-
   start,   --start      启动 SillyTavern
   doctor,  --doctor     运行 Termux 与酒馆环境自检
   mirror,  --mirror     测速并配置 Termux / GitHub / npm 加速源
-  config,  --config     配置性能预设、快捷命令与局域网监听
+  config,  --config     打开设置（自启动开关、性能预设、快捷命令、局域网）
 
 常用选项:
   -d, --dir <路径>              安装目录 (默认: $HOME/SillyTavern)
@@ -69,11 +70,14 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/carpediemzen/st-
   --npm-registry <URL>          自定义 npm 源 URL
   --perf / --no-perf            强制开启或跳过安卓 config.yaml 预设
   --alias / --no-alias          强制开启或跳过写入 shell 快捷指令
+  --autostart / --no-autostart  开启或关闭打开 Termux 默认启动（可配合 install / config）
   --start-after                 安装完成后立即启动酒馆
   -y, --yes                     非交互自动确认
 ```
 
 ## 常用维护建议
+
+- **关闭或重新开启自启动**：输入 `stmenu` 进入 `6) 设置` 选择第 1 项一键切换；或直接执行 `st-termux config --no-autostart` / `st-termux config --autostart`。临时单次跳过自启动可运行 `ST_NO_AUTOSTART=1 bash`。
 
 - **防止切后台断连**：在 Termux 下拉通知栏点击 **Acquire wakelock**，或在终端执行 `termux-wake-lock`。
 - **局域网手机/电脑访问**：通过 `stmenu` -> `6) 配置` 开启 `listen: true` 后，请务必配置 `config.yaml` 中的 `whitelist` 或开启 `basicAuthMode` 并修改默认账号密码。
